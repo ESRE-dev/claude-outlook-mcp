@@ -229,19 +229,40 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
   console.error(`[getUnreadEmails] Getting unread emails from folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
+  const isDefaultInbox_unread = folder === "Inbox";
+  const folderSetup_unread = isDefaultInbox_unread
+    ? `-- Prefer Exchange account inbox over local inbox
+        try
+          set theFolder to inbox of exchange account 1
+        on error
+          set theFolder to inbox
+        end try`
+    : `-- Search for custom folder by name
+        set theFolder to inbox
+        set allFolders to every mail folder
+        repeat with mailFolder in allFolders
+          if name of mailFolder is "${folder}" then
+            set theFolder to mailFolder
+            exit repeat
+          end if
+        end repeat`;
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath} -- Use the specified folder or default to inbox
+        ${folderSetup_unread}
         set unreadMessages to {}
         set allMessages to messages of theFolder
         set i to 0
         
         repeat with theMessage in allMessages
-          if read status of theMessage is false then
+          if is read of theMessage is false then
             set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
+            try
+              set senderAddr to address of sender of theMessage
+            on error
+              set senderAddr to "unknown"
+            end try
+            set msgData to {subject:subject of theMessage, sender:senderAddr, ¬
                        date:time sent of theMessage, id:id of theMessage}
             
             -- Try to get content
@@ -328,11 +349,27 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
+  const isDefaultInbox_search = folder === "Inbox";
+  const folderSetup_search = isDefaultInbox_search
+    ? `-- Prefer Exchange account inbox over local inbox
+        try
+          set theFolder to inbox of exchange account 1
+        on error
+          set theFolder to inbox
+        end try`
+    : `-- Search for custom folder by name
+        set theFolder to inbox
+        set allFolders to every mail folder
+        repeat with mailFolder in allFolders
+          if name of mailFolder is "${folder}" then
+            set theFolder to mailFolder
+            exit repeat
+          end if
+        end repeat`;
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath}
+        ${folderSetup_search}
         set searchResults to {}
         set allMessages to messages of theFolder
         set i to 0
@@ -341,7 +378,12 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
         repeat with theMessage in allMessages
           if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
             set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
+            try
+              set senderAddr to address of sender of theMessage
+            on error
+              set senderAddr to "unknown"
+            end try
+            set msgData to {subject:subject of theMessage, sender:senderAddr, ¬
                        date:time sent of theMessage, id:id of theMessage}
             
             -- Try to get content
@@ -769,17 +811,26 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
     const script = `
       tell application "Microsoft Outlook"
         try
-          -- Get the folder by name safely
+          -- Get the folder, preferring Exchange account
           set targetFolder to null
-          set allFolders to mail folders
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${folder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          
-          if targetFolder is null then set targetFolder to inbox
+          if "${folder}" is "Inbox" then
+            -- Prefer Exchange inbox over local inbox
+            try
+              set targetFolder to inbox of exchange account 1
+            on error
+              set targetFolder to inbox
+            end try
+          else
+            -- Search all mail folders by name
+            set allFolders to every mail folder
+            repeat with mailFolder in allFolders
+              if name of mailFolder is "${folder}" then
+                set targetFolder to mailFolder
+                exit repeat
+              end if
+            end repeat
+            if targetFolder is null then set targetFolder to inbox
+          end if
           
           -- Get messages
           set messageList to {}
@@ -792,7 +843,11 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
             try
               set theMsg to item i of allMsgs
               set msgSubject to subject of theMsg
-              set msgSender to sender of theMsg
+              try
+                set msgSender to address of sender of theMsg
+              on error
+                set msgSender to "unknown"
+              end try
               set msgDate to time sent of theMsg
               
               -- Create a simple text representation for the message
@@ -849,12 +904,24 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
   const script = `
     tell application "Microsoft Outlook"
       set todayEvents to {}
-      set theCalendar to default calendar
+      -- Find the main calendar (first one named "Calendar" with events, falling back to first calendar)
+      set allCalendars to every calendar
+      set theCalendar to item 1 of allCalendars
+      set bestCount to 0
+      repeat with cal in allCalendars
+        if name of cal is "Calendar" then
+          set evtCount to count of calendar events of cal
+          if evtCount > bestCount then
+            set theCalendar to cal
+            set bestCount to evtCount
+          end if
+        end if
+      end repeat
       set todayDate to current date
       set startOfDay to todayDate - (time of todayDate)
-      set endOfDay to startOfDay + 1 * days
+      set dayEnd to startOfDay + 1 * days
       
-      set eventList to events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than endOfDay
+      set eventList to calendar events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than dayEnd
       
       set eventCount to count of eventList
       set limitCount to ${limit}
@@ -863,18 +930,28 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
         set limitCount to eventCount
       end if
       
+      set eventResults to ""
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of todayEvents to eventData
+        set evtSubject to subject of theEvent
+        set evtStart to start time of theEvent
+        set evtEndTime to end time of theEvent
+        try
+          set evtLocation to location of theEvent
+        on error
+          set evtLocation to ""
+        end try
+        set evtId to id of theEvent
+
+        set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+        if i > 1 then
+          set eventResults to eventResults & "%%%" & eventLine
+        else
+          set eventResults to eventLine
+        end if
       end repeat
-      
-      return todayEvents
+
+      return eventResults
     end tell
   `;
   
@@ -883,39 +960,24 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
     console.error(`[getTodayEvents] Raw result length: ${result.length}`);
     
     // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const events: any[] = [];
+
+    if (result && !result.startsWith("Error:")) {
+      const eventLines = result.split('%%%');
+      for (const line of eventLines) {
+        const parts = line.split('||');
+        if (parts.length >= 5) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim()
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[getTodayEvents] Error parsing event match:', parseError);
         }
       }
     }
-    
+
     console.error(`[getTodayEvents] Found ${events.length} events for today`);
     return events;
   } catch (error) {
@@ -932,12 +994,24 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
   const script = `
     tell application "Microsoft Outlook"
       set upcomingEvents to {}
-      set theCalendar to default calendar
+      -- Find the main calendar (first one named "Calendar" with events, falling back to first calendar)
+      set allCalendars to every calendar
+      set theCalendar to item 1 of allCalendars
+      set bestCount to 0
+      repeat with cal in allCalendars
+        if name of cal is "Calendar" then
+          set evtCount to count of calendar events of cal
+          if evtCount > bestCount then
+            set theCalendar to cal
+            set bestCount to evtCount
+          end if
+        end if
+      end repeat
       set todayDate to current date
       set startOfToday to todayDate - (time of todayDate)
-      set endDate to startOfToday + ${days} * days
+      set dayEndDate to startOfToday + ${days} * days
       
-      set eventList to events of theCalendar whose start time is greater than or equal to todayDate and start time is less than endDate
+      set eventList to calendar events of theCalendar whose start time is greater than or equal to todayDate and start time is less than dayEndDate
       
       set eventCount to count of eventList
       set limitCount to ${limit}
@@ -946,18 +1020,28 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
         set limitCount to eventCount
       end if
       
+      set eventResults to ""
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
-        set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
-                     location:location of theEvent, ¬
-                     id:id of theEvent}
-        
-        set end of upcomingEvents to eventData
+        set evtSubject to subject of theEvent
+        set evtStart to start time of theEvent
+        set evtEndTime to end time of theEvent
+        try
+          set evtLocation to location of theEvent
+        on error
+          set evtLocation to ""
+        end try
+        set evtId to id of theEvent
+
+        set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+        if i > 1 then
+          set eventResults to eventResults & "%%%" & eventLine
+        else
+          set eventResults to eventLine
+        end if
       end repeat
-      
-      return upcomingEvents
+
+      return eventResults
     end tell
   `;
   
@@ -966,39 +1050,24 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
     console.error(`[getUpcomingEvents] Raw result length: ${result.length}`);
     
     // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const events: any[] = [];
+
+    if (result && !result.startsWith("Error:")) {
+      const eventLines = result.split('%%%');
+      for (const line of eventLines) {
+        const parts = line.split('||');
+        if (parts.length >= 5) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim()
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[getUpcomingEvents] Error parsing event match:', parseError);
         }
       }
     }
-    
+
     console.error(`[getUpcomingEvents] Found ${events.length} upcoming events`);
     return events;
   } catch (error) {
@@ -1015,30 +1084,52 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   const script = `
     tell application "Microsoft Outlook"
       set searchResults to {}
-      set theCalendar to default calendar
-      set allEvents to events of theCalendar
+      -- Find the main calendar (first one named "Calendar" with events, falling back to first calendar)
+      set allCalendars to every calendar
+      set theCalendar to item 1 of allCalendars
+      set bestCount to 0
+      repeat with cal in allCalendars
+        if name of cal is "Calendar" then
+          set evtCount to count of calendar events of cal
+          if evtCount > bestCount then
+            set theCalendar to cal
+            set bestCount to evtCount
+          end if
+        end if
+      end repeat
+      set allEvents to calendar events of theCalendar
       set i to 0
       set searchString to "${searchTerm.replace(/"/g, '\\"')}"
       
+      set eventResults to ""
       repeat with theEvent in allEvents
         if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
           set i to i + 1
-          set eventData to {subject:subject of theEvent, ¬
-                       start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
-                       location:location of theEvent, ¬
-                       id:id of theEvent}
-          
-          set end of searchResults to eventData
-          
+          set evtSubject to subject of theEvent
+          set evtStart to start time of theEvent
+          set evtEndTime to end time of theEvent
+          try
+            set evtLocation to location of theEvent
+          on error
+            set evtLocation to ""
+          end try
+          set evtId to id of theEvent
+
+          set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+          if i > 1 then
+            set eventResults to eventResults & "%%%" & eventLine
+          else
+            set eventResults to eventLine
+          end if
+
           -- Stop if we've reached the limit
           if i >= ${limit} then
             exit repeat
           end if
         end if
       end repeat
-      
-      return searchResults
+
+      return eventResults
     end tell
   `;
   
@@ -1047,39 +1138,24 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
     console.error(`[searchEvents] Raw result length: ${result.length}`);
     
     // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
+    const events: any[] = [];
+
+    if (result && !result.startsWith("Error:")) {
+      const eventLines = result.split('%%%');
+      for (const line of eventLines) {
+        const parts = line.split('||');
+        if (parts.length >= 5) {
+          events.push({
+            subject: parts[0].trim(),
+            start: parts[1].trim(),
+            end: parts[2].trim(),
+            location: parts[3].trim() || "No location",
+            id: parts[4].trim()
           });
-          
-          if (event.subject) {
-            events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
-            });
-          }
-        } catch (parseError) {
-          console.error('[searchEvents] Error parsing event match:', parseError);
         }
       }
     }
-    
+
     console.error(`[searchEvents] Found ${events.length} matching events`);
     return events;
   } catch (error) {
@@ -1108,7 +1184,19 @@ async function createEvent(subject: string, start: string, end: string, location
   
   let script = `
     tell application "Microsoft Outlook"
-      set theCalendar to default calendar
+      -- Find the main calendar (first one named "Calendar" with events, falling back to first calendar)
+      set allCalendars to every calendar
+      set theCalendar to item 1 of allCalendars
+      set bestCount to 0
+      repeat with cal in allCalendars
+        if name of cal is "Calendar" then
+          set evtCount to count of calendar events of cal
+          if evtCount > bestCount then
+            set theCalendar to cal
+            set bestCount to evtCount
+          end if
+        end if
+      end repeat
       set newEvent to make new calendar event at theCalendar with properties {subject:"${escapedSubject}", start time:${formattedStart}, end time:${formattedEnd}
   `;
   
