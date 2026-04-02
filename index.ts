@@ -241,7 +241,7 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
         set theFolder to inbox
         set allFolders to every mail folder
         repeat with mailFolder in allFolders
-          if name of mailFolder is "${folder}" then
+          if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
             set theFolder to mailFolder
             exit repeat
           end if
@@ -361,7 +361,7 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
         set theFolder to inbox
         set allFolders to every mail folder
         repeat with mailFolder in allFolders
-          if name of mailFolder is "${folder}" then
+          if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
             set theFolder to mailFolder
             exit repeat
           end if
@@ -813,7 +813,7 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
         try
           -- Get the folder, preferring Exchange account
           set targetFolder to null
-          if "${folder}" is "Inbox" then
+          if "${folder.replace(/"/g, '\\"')}" is "Inbox" then
             -- Prefer Exchange inbox over local inbox
             try
               set targetFolder to inbox of exchange account 1
@@ -824,7 +824,7 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
             -- Search all mail folders by name
             set allFolders to every mail folder
             repeat with mailFolder in allFolders
-              if name of mailFolder is "${folder}" then
+              if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
                 set targetFolder to mailFolder
                 exit repeat
               end if
@@ -943,9 +943,9 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
         end try
         set evtId to id of theEvent
 
-        set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+        set eventLine to evtSubject & (ASCII character 31) & evtStart & (ASCII character 31) & evtEndTime & (ASCII character 31) & evtLocation & (ASCII character 31) & evtId
         if i > 1 then
-          set eventResults to eventResults & "%%%" & eventLine
+          set eventResults to eventResults & (ASCII character 30) & eventLine
         else
           set eventResults to eventLine
         end if
@@ -963,9 +963,9 @@ async function getTodayEvents(limit: number = 10): Promise<any[]> {
     const events: any[] = [];
 
     if (result && !result.startsWith("Error:")) {
-      const eventLines = result.split('%%%');
+      const eventLines = result.split('\x1E');
       for (const line of eventLines) {
-        const parts = line.split('||');
+        const parts = line.split('\x1F');
         if (parts.length >= 5) {
           events.push({
             subject: parts[0].trim(),
@@ -1033,9 +1033,9 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
         end try
         set evtId to id of theEvent
 
-        set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+        set eventLine to evtSubject & (ASCII character 31) & evtStart & (ASCII character 31) & evtEndTime & (ASCII character 31) & evtLocation & (ASCII character 31) & evtId
         if i > 1 then
-          set eventResults to eventResults & "%%%" & eventLine
+          set eventResults to eventResults & (ASCII character 30) & eventLine
         else
           set eventResults to eventLine
         end if
@@ -1053,9 +1053,9 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
     const events: any[] = [];
 
     if (result && !result.startsWith("Error:")) {
-      const eventLines = result.split('%%%');
+      const eventLines = result.split('\x1E');
       for (const line of eventLines) {
-        const parts = line.split('||');
+        const parts = line.split('\x1F');
         if (parts.length >= 5) {
           events.push({
             subject: parts[0].trim(),
@@ -1115,9 +1115,9 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
           end try
           set evtId to id of theEvent
 
-          set eventLine to evtSubject & "||" & evtStart & "||" & evtEndTime & "||" & evtLocation & "||" & evtId
+          set eventLine to evtSubject & (ASCII character 31) & evtStart & (ASCII character 31) & evtEndTime & (ASCII character 31) & evtLocation & (ASCII character 31) & evtId
           if i > 1 then
-            set eventResults to eventResults & "%%%" & eventLine
+            set eventResults to eventResults & (ASCII character 30) & eventLine
           else
             set eventResults to eventLine
           end if
@@ -1141,9 +1141,9 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
     const events: any[] = [];
 
     if (result && !result.startsWith("Error:")) {
-      const eventLines = result.split('%%%');
+      const eventLines = result.split('\x1E');
       for (const line of eventLines) {
-        const parts = line.split('||');
+        const parts = line.split('\x1F');
         if (parts.length >= 5) {
           events.push({
             subject: parts[0].trim(),
