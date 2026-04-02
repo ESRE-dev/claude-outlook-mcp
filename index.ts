@@ -7,9 +7,11 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { runAppleScript } from "run-applescript";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, constants as fsConstants } from "node:fs";
+import { access, stat } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 // ====================================================
 // 0. Security Helpers & Configuration
@@ -35,28 +37,35 @@ function expandTilde(p: string): string {
  * Load attachment allowlist from config.json.
  * Falls back to sensible defaults if the config file is missing or malformed.
  */
+let _cachedAllowlist: string[] | null = null;
+
 function loadAttachmentAllowlist(): string[] {
+  if (_cachedAllowlist) return _cachedAllowlist;
+
   const defaults = ["~/Downloads", "~/Documents", "~/Desktop"];
   try {
     const configPath = resolve(
-      dirname(new URL(import.meta.url).pathname),
+      dirname(fileURLToPath(import.meta.url)),
       "config.json",
     );
     const raw = readFileSync(configPath, "utf-8");
     const config = JSON.parse(raw);
     const dirs = config?.attachments?.allowedDirectories;
     if (Array.isArray(dirs) && dirs.length > 0) {
+      _cachedAllowlist = dirs;
       return dirs;
     }
     console.error(
       "[config] No allowedDirectories in config.json, using defaults",
     );
+    _cachedAllowlist = defaults;
     return defaults;
   } catch (err) {
     console.error(
       "[config] Could not load config.json, using defaults:",
       (err as Error).message,
     );
+    _cachedAllowlist = defaults;
     return defaults;
   }
 }
@@ -104,7 +113,7 @@ function validateAttachmentPath(filePath: string): string {
   throw new Error(
     `SECURITY: Attachment path "${filePath}" (resolved to "${canonicalPath}") is outside allowed directories [${displayAllowed}]. ` +
       `To allow this path, add its parent directory to the "attachments.allowedDirectories" array in config.json ` +
-      `(located at ${resolve(dirname(new URL(import.meta.url).pathname), "config.json")}).`,
+      `(located at ${resolve(dirname(fileURLToPath(import.meta.url)), "config.json")}).`,
   );
 }
 
@@ -577,13 +586,8 @@ async function checkAttachmentPath(filePath: string): Promise<string> {
     fullPath = validateAttachmentPath(fullPath);
 
     // Check if the file exists and is readable
-    const fs = require("fs");
-    const { promisify } = require("util");
-    const access = promisify(fs.access);
-    const stat = promisify(fs.stat);
-
     try {
-      await access(fullPath, fs.constants.R_OK);
+      await access(fullPath, fsConstants.R_OK);
       const stats = await stat(fullPath);
 
       return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
@@ -630,7 +634,7 @@ async function debugSendEmailWithAttachment(
         try
           set newMessage to make new outgoing message with properties {subject:"DEBUG: ${escapeForAppleScript(subject)}", visible:true}
           set content of newMessage to "${escapeForAppleScript(body)}"
-          set to recipients of newMessage to {"${to}"}
+          set to recipients of newMessage to {"${escapeForAppleScript(to)}"}
 
           try
             set attachmentFile to POSIX file "${escapeForAppleScript(attachmentPath)}"
@@ -737,9 +741,9 @@ async function sendEmail(
           }
 
           tell msg
-            set recipTo to make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
-            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${ccName}", address:"${cc}"}}` : ""}
-            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${bccName}", address:"${bcc}"}}` : ""}
+            set recipTo to make new to recipient with properties {email address:{name:"${escapeForAppleScript(toName)}", address:"${escapeForAppleScript(to)}"}}
+            ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${escapeForAppleScript(ccName)}", address:"${escapeForAppleScript(cc)}"}}` : ""}
+            ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${escapeForAppleScript(bccName)}", address:"${escapeForAppleScript(bcc)}"}}` : ""}
 
             ${attachmentScript}
           end tell
@@ -783,9 +787,9 @@ async function sendEmail(
                 : `set content of theMessage to "${escapedBody}"`
             }
 
-            set to recipients of theMessage to {"${to}"}
-            ${cc ? `set cc recipients of theMessage to {"${cc}"}` : ""}
-            ${bcc ? `set bcc recipients of theMessage to {"${bcc}"}` : ""}
+            set to recipients of theMessage to {"${escapeForAppleScript(to)}"}
+            ${cc ? `set cc recipients of theMessage to {"${escapeForAppleScript(cc)}"}` : ""}
+            ${bcc ? `set bcc recipients of theMessage to {"${escapeForAppleScript(bcc)}"}` : ""}
 
             ${processedAttachments
               .map((filePath) => {
@@ -839,9 +843,9 @@ async function sendEmail(
                   : `set content of newMessage to "${escapedBody}"`
               }
 
-              set to recipients of newMessage to {"${to}"}
-              ${cc ? `set cc recipients of newMessage to {"${cc}"}` : ""}
-              ${bcc ? `set bcc recipients of newMessage to {"${bcc}"}` : ""}
+              set to recipients of newMessage to {"${escapeForAppleScript(to)}"}
+              ${cc ? `set cc recipients of newMessage to {"${escapeForAppleScript(cc)}"}` : ""}
+              ${bcc ? `set bcc recipients of newMessage to {"${escapeForAppleScript(bcc)}"}` : ""}
 
               ${processedAttachments
                 .map((filePath) => {
