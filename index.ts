@@ -7,6 +7,119 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { runAppleScript } from "run-applescript";
+import {
+  readFileSync,
+  realpathSync,
+  accessSync,
+  statSync,
+  constants as fsConstants,
+} from "node:fs";
+import { resolve, dirname } from "node:path";
+import { homedir } from "node:os";
+
+// ====================================================
+// 0. Security Helpers & Configuration
+// ====================================================
+
+/**
+ * Escape a string for safe interpolation into an AppleScript string literal.
+ * Escapes backslashes first (so they don't re-escape quotes), then double quotes.
+ */
+function escapeForAppleScript(str: string): string {
+  return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
+ * Load attachment allowlist from config.json.
+ * Falls back to sensible defaults if the config file is missing or malformed.
+ */
+function loadAttachmentAllowlist(): string[] {
+  const defaults = ["~/Downloads", "~/Documents", "~/Desktop"];
+  try {
+    const configPath = resolve(
+      dirname(new URL(import.meta.url).pathname),
+      "config.json",
+    );
+    const raw = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(raw);
+    const dirs = config?.attachments?.allowedDirectories;
+    if (Array.isArray(dirs) && dirs.length > 0) {
+      return dirs;
+    }
+    console.error(
+      "[config] No allowedDirectories in config.json, using defaults",
+    );
+    return defaults;
+  } catch (err) {
+    console.error(
+      "[config] Could not load config.json, using defaults:",
+      (err as Error).message,
+    );
+    return defaults;
+  }
+}
+
+/** Resolve ~ to the actual home directory */
+function expandTilde(p: string): string {
+  if (p.startsWith("~/") || p === "~") {
+    return p.replace("~", homedir());
+  }
+  return p;
+}
+
+/**
+ * Validate that a file path is within the attachment allowlist.
+ * Resolves symlinks and relative segments before checking.
+ * Throws with a descriptive message if the path is outside all allowed directories.
+ */
+function validateAttachmentPath(filePath: string): string {
+  // Resolve to absolute path
+  let absolutePath = filePath;
+  if (!filePath.startsWith("/")) {
+    absolutePath = resolve(process.cwd(), filePath);
+  }
+
+  // Canonicalize: resolve symlinks and .. segments
+  let canonicalPath: string;
+  try {
+    // realpathSync requires the file to exist
+    canonicalPath = realpathSync(absolutePath);
+  } catch {
+    // File may not exist yet (unlikely for attachments, but handle gracefully)
+    canonicalPath = resolve(absolutePath);
+  }
+
+  // Check against allowlist
+  const allowedDirs = loadAttachmentAllowlist();
+  const expandedAllowed = allowedDirs.map((d) => expandTilde(d));
+
+  for (const allowedDir of expandedAllowed) {
+    let canonicalAllowed: string;
+    try {
+      canonicalAllowed = realpathSync(allowedDir);
+    } catch {
+      canonicalAllowed = resolve(allowedDir);
+    }
+    // Ensure trailing slash for prefix check to prevent /Users/x/DesktopEvil matching /Users/x/Desktop
+    const prefix = canonicalAllowed.endsWith("/")
+      ? canonicalAllowed
+      : canonicalAllowed + "/";
+    if (
+      canonicalPath === canonicalAllowed ||
+      canonicalPath.startsWith(prefix)
+    ) {
+      return canonicalPath;
+    }
+  }
+
+  // Rejected — build a helpful error message
+  const displayAllowed = allowedDirs.join(", ");
+  throw new Error(
+    `SECURITY: Attachment path "${filePath}" (resolved to "${canonicalPath}") is outside allowed directories [${displayAllowed}]. ` +
+      `To allow this path, add its parent directory to the "attachments.allowedDirectories" array in config.json ` +
+      `(located at ${resolve(dirname(new URL(import.meta.url).pathname), "config.json")}).`,
+  );
+}
 
 // ====================================================
 // 1. Tool Definitions
@@ -310,7 +423,7 @@ async function getUnreadEmails(
         set theFolder to inbox
         set allFolders to every mail folder
         repeat with mailFolder in allFolders
-          if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
+          if name of mailFolder is "${escapeForAppleScript(folder)}" then
             set theFolder to mailFolder
             exit repeat
           end if
@@ -439,7 +552,7 @@ async function searchEmails(
         set theFolder to inbox
         set allFolders to every mail folder
         repeat with mailFolder in allFolders
-          if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
+          if name of mailFolder is "${escapeForAppleScript(folder)}" then
             set theFolder to mailFolder
             exit repeat
           end if
@@ -451,7 +564,7 @@ async function searchEmails(
         set searchResults to {}
         set allMessages to messages of theFolder
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+        set searchString to "${escapeForAppleScript(searchTerm)}"
 
         repeat with theMessage in allMessages
           if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
@@ -554,6 +667,9 @@ async function checkAttachmentPath(filePath: string): Promise<string> {
       fullPath = `${cwd}/${filePath}`;
     }
 
+    // Security: validate against attachment allowlist
+    fullPath = validateAttachmentPath(fullPath);
+
     // Check if the file exists and is readable
     const fs = require("fs");
     const { promisify } = require("util");
@@ -586,7 +702,7 @@ async function debugSendEmailWithAttachment(
 
   // Create a simple AppleScript that just attempts to open the file
   const script = `
-    set theFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+    set theFile to POSIX file "${escapeForAppleScript(attachmentPath)}"
     try
       tell application "Finder"
         set fileExists to exists file theFile
@@ -606,12 +722,12 @@ async function debugSendEmailWithAttachment(
     const emailScript = `
       tell application "Microsoft Outlook"
         try
-          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${subject.replace(/"/g, '\\"')}", visible:true}
-          set content of newMessage to "${body.replace(/"/g, '\\"')}"
+          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${escapeForAppleScript(subject)}", visible:true}
+          set content of newMessage to "${escapeForAppleScript(body)}"
           set to recipients of newMessage to {"${to}"}
 
           try
-            set attachmentFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+            set attachmentFile to POSIX file "${escapeForAppleScript(attachmentPath)}"
             make new attachment at newMessage with properties {file:attachmentFile}
             set attachResult to "Successfully attached file"
           on error attachErrMsg
@@ -666,23 +782,20 @@ async function sendEmail(
   const bccName = bcc ? extractNameFromEmail(bcc) : "";
 
   // Escape special characters
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  const escapedSubject = escapeForAppleScript(subject);
+  const escapedBody = escapeForAppleScript(body).replace(/\n/g, "\\n");
 
   // Process attachments: Convert to absolute paths if they are relative
   let processedAttachments: string[] = [];
   if (attachments && attachments.length > 0) {
-    processedAttachments = attachments.map((path) => {
-      // Check if path is absolute (starts with /)
-      if (path.startsWith("/")) {
-        return path;
-      }
-      // Get current working directory and join with relative path
-      const cwd = process.cwd();
-      return `${cwd}/${path}`;
-    });
+    for (const attachPath of attachments) {
+      // validateAttachmentPath resolves to absolute, canonicalizes, and checks allowlist.
+      // Throws with a descriptive error if the path is outside allowed directories.
+      const validated = validateAttachmentPath(attachPath);
+      processedAttachments.push(validated);
+    }
     console.error(
-      `[sendEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`,
+      `[sendEmail] Validated attachments: ${processedAttachments.length} file(s) passed allowlist check`,
     );
   }
 
@@ -691,7 +804,7 @@ async function sendEmail(
     processedAttachments.length > 0
       ? processedAttachments
           .map((filePath) => {
-            const escapedPath = filePath.replace(/"/g, '\\"');
+            const escapedPath = escapeForAppleScript(filePath);
             return `
         try
           set attachmentFile to POSIX file "${escapedPath}"
@@ -772,7 +885,7 @@ async function sendEmail(
 
             ${processedAttachments
               .map((filePath) => {
-                const escapedPath = filePath.replace(/"/g, '\\"');
+                const escapedPath = escapeForAppleScript(filePath);
                 return `
                 try
                   set attachmentFile to POSIX file "${escapedPath}"
@@ -828,7 +941,7 @@ async function sendEmail(
 
               ${processedAttachments
                 .map((filePath) => {
-                  const escapedPath = filePath.replace(/"/g, '\\"');
+                  const escapedPath = escapeForAppleScript(filePath);
                   return `
                   try
                     set attachmentFile to POSIX file "${escapedPath}"
@@ -912,7 +1025,7 @@ async function readEmails(
         try
           -- Get the folder, preferring Exchange account
           set targetFolder to null
-          if "${folder.replace(/"/g, '\\"')}" is "Inbox" then
+          if "${escapeForAppleScript(folder)}" is "Inbox" then
             -- Prefer Exchange inbox over local inbox
             try
               set targetFolder to inbox of exchange account 1
@@ -923,7 +1036,7 @@ async function readEmails(
             -- Search all mail folders by name
             set allFolders to every mail folder
             repeat with mailFolder in allFolders
-              if name of mailFolder is "${folder.replace(/"/g, '\\"')}" then
+              if name of mailFolder is "${escapeForAppleScript(folder)}" then
                 set targetFolder to mailFolder
                 exit repeat
               end if
@@ -1008,8 +1121,10 @@ async function deleteEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
-  const escapedFilter = subjectFilter ? subjectFilter.replace(/"/g, '\\"') : "";
+  const escapedFolder = escapeForAppleScript(folder);
+  const escapedFilter = subjectFilter
+    ? escapeForAppleScript(subjectFilter)
+    : "";
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1108,9 +1223,11 @@ async function moveEmails(
   );
   await checkOutlookAccess();
 
-  const escapedSource = sourceFolder.replace(/"/g, '\\"');
-  const escapedDest = destinationFolder.replace(/"/g, '\\"');
-  const escapedFilter = subjectFilter ? subjectFilter.replace(/"/g, '\\"') : "";
+  const escapedSource = escapeForAppleScript(sourceFolder);
+  const escapedDest = escapeForAppleScript(destinationFolder);
+  const escapedFilter = subjectFilter
+    ? escapeForAppleScript(subjectFilter)
+    : "";
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1230,8 +1347,10 @@ async function markEmailsRead(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
-  const escapedFilter = subjectFilter ? subjectFilter.replace(/"/g, '\\"') : "";
+  const escapedFolder = escapeForAppleScript(folder);
+  const escapedFilter = subjectFilter
+    ? escapeForAppleScript(subjectFilter)
+    : "";
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1316,8 +1435,10 @@ async function countEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
-  const escapedFilter = subjectFilter ? subjectFilter.replace(/"/g, '\\"') : "";
+  const escapedFolder = escapeForAppleScript(folder);
+  const escapedFilter = subjectFilter
+    ? escapeForAppleScript(subjectFilter)
+    : "";
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1400,7 +1521,7 @@ async function getMessageDetail(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
+  const escapedFolder = escapeForAppleScript(folder);
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1543,10 +1664,10 @@ async function forwardEmail(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
-  const escapedTo = to.replace(/"/g, '\\"');
+  const escapedFolder = escapeForAppleScript(folder);
+  const escapedTo = escapeForAppleScript(to);
   const escapedComment = comment
-    ? comment.replace(/"/g, '\\"').replace(/\n/g, "\\n")
+    ? escapeForAppleScript(comment).replace(/\n/g, "\\n")
     : "";
 
   const script = `
@@ -1633,8 +1754,10 @@ async function archiveEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = folder.replace(/"/g, '\\"');
-  const escapedFilter = subjectFilter ? subjectFilter.replace(/"/g, '\\"') : "";
+  const escapedFolder = escapeForAppleScript(folder);
+  const escapedFilter = subjectFilter
+    ? escapeForAppleScript(subjectFilter)
+    : "";
 
   const script = `
     tell application "Microsoft Outlook"
@@ -1952,7 +2075,7 @@ async function searchEvents(
       end repeat
       set allEvents to calendar events of theCalendar
       set i to 0
-      set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+      set searchString to "${escapeForAppleScript(searchTerm)}"
 
       set eventResults to ""
       repeat with theEvent in allEvents
@@ -2040,9 +2163,9 @@ async function createEvent(
   const formattedEnd = `date "${endDate.getMonth() + 1}/${endDate.getDate()}/${endDate.getFullYear()} ${endDate.getHours()}:${endDate.getMinutes()}:${endDate.getSeconds()}"`;
 
   // Escape strings for AppleScript
-  const escapedSubject = subject.replace(/"/g, '\\"');
-  const escapedLocation = location ? location.replace(/"/g, '\\"') : "";
-  const escapedBody = body ? body.replace(/"/g, '\\"') : "";
+  const escapedSubject = escapeForAppleScript(subject);
+  const escapedLocation = location ? escapeForAppleScript(location) : "";
+  const escapedBody = body ? escapeForAppleScript(body) : "";
 
   let script = `
     tell application "Microsoft Outlook"
@@ -2078,7 +2201,7 @@ async function createEvent(
     const attendeeList = attendees.split(",").map((email) => email.trim());
 
     for (const attendee of attendeeList) {
-      const escapedAttendee = attendee.replace(/"/g, '\\"');
+      const escapedAttendee = escapeForAppleScript(attendee);
       script += `
         make new attendee at newEvent with properties {email address:"${escapedAttendee}"}
       `;
@@ -2271,7 +2394,7 @@ async function searchContacts(
         set searchResults to {}
         set allContacts to contacts
         set i to 0
-        set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+        set searchString to "${escapeForAppleScript(searchTerm)}"
 
         repeat with theContact in allContacts
           try
@@ -2376,7 +2499,7 @@ async function searchContacts(
       const alternativeScript = `
           tell application "Microsoft Outlook"
             set matchingContacts to {}
-            set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+            set searchString to "${escapeForAppleScript(searchTerm)}"
             set i to 0
 
             repeat with theContact in contacts
