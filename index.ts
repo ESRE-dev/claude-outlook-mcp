@@ -131,21 +131,26 @@ function senderScript(msgVar: string, resultVar: string): string {
   return `
             set ${resultVar} to "unknown"
             try
-              set _sName to name of sender of ${msgVar}
-              set _sAddr to address of sender of ${msgVar}
-              if _sName is not missing value and _sName is not "" and _sAddr is not missing value and _sAddr is not "" then
+              set _senderObj to sender of ${msgVar}
+              set _sName to ""
+              set _sAddr to ""
+              try
+                set _sName to name of _senderObj
+              end try
+              try
+                set _sAddr to address of _senderObj
+              end try
+              if _sName is not "" and _sAddr is not "" then
                 set ${resultVar} to _sName & " <" & _sAddr & ">"
-              else if _sName is not missing value and _sName is not "" then
+              else if _sName is not "" then
                 set ${resultVar} to _sName
-              else if _sAddr is not missing value and _sAddr is not "" then
+              else if _sAddr is not "" then
                 set ${resultVar} to _sAddr
               end if
             on error
-              try
-                set ${resultVar} to (sender of ${msgVar} as text)
-              on error
-                set ${resultVar} to "unknown"
-              end try
+              -- Never fall back to "sender as text" — it produces binary garbage
+              -- for Exchange users. Just leave as "unknown".
+              set ${resultVar} to "unknown"
             end try`;
 }
 
@@ -546,38 +551,70 @@ async function getUnreadEmails(
         set RS to ASCII character 30
         set US to ASCII character 31
 
-        -- Use "whose" for fast server-side filtering instead of iterating all messages
-        set unreadMsgs to (every message of theFolder whose is read is false)
+        -- Build a flat list of folders to scan: root + subfolders up to 3 levels deep
+        set foldersToScan to {theFolder}
+        try
+          repeat with sf1 in (mail folders of theFolder)
+            set end of foldersToScan to (contents of sf1)
+            try
+              repeat with sf2 in (mail folders of sf1)
+                set end of foldersToScan to (contents of sf2)
+                try
+                  repeat with sf3 in (mail folders of sf2)
+                    set end of foldersToScan to (contents of sf3)
+                  end repeat
+                end try
+              end repeat
+            end try
+          end repeat
+        end try
+
+        set totalFound to 0
+        set totalUnread to 0
         set msgLimit to ${limit}
-        set totalUnread to count of unreadMsgs
-        if totalUnread < msgLimit then set msgLimit to totalUnread
-
         set output to ""
-        repeat with i from 1 to msgLimit
-          set theMsg to item i of unreadMsgs
 
-          set msgSubject to subject of theMsg
-          ${senderScript("theMsg", "senderInfo")}
-          set msgDate to time sent of theMsg as text
-          set msgId to id of theMsg as text
+        -- Scan each folder for unread messages
+        repeat with scanFolder in foldersToScan
+          set folderName to name of scanFolder
+          set unreadMsgs to (every message of scanFolder whose is read is false)
+          set unreadCount to count of unreadMsgs
+          set totalUnread to totalUnread + unreadCount
 
-          -- Try to get content preview
-          set msgContent to "[Content not available]"
-          try
-            set rawContent to content of theMsg
-            if length of rawContent > 500 then
-              set msgContent to (text 1 thru 500 of rawContent) & "..."
-            else
-              set msgContent to rawContent
-            end if
-          end try
+          if unreadCount > 0 and totalFound < msgLimit then
+            set remaining to msgLimit - totalFound
+            if unreadCount < remaining then set remaining to unreadCount
 
-          set msgLine to msgSubject & US & senderInfo & US & msgDate & US & msgContent & US & msgId
-          if i > 1 then
-            set output to output & RS & msgLine
-          else
-            set output to msgLine
+            repeat with i from 1 to remaining
+              set theMsg to item i of unreadMsgs
+
+              set msgSubject to subject of theMsg
+              ${senderScript("theMsg", "senderInfo")}
+              set msgDate to time sent of theMsg as text
+              set msgId to id of theMsg as text
+
+              -- Try to get content preview
+              set msgContent to "[Content not available]"
+              try
+                set rawContent to content of theMsg
+                if length of rawContent > 500 then
+                  set msgContent to (text 1 thru 500 of rawContent) & "..."
+                else
+                  set msgContent to rawContent
+                end if
+              end try
+
+              set msgLine to msgSubject & US & senderInfo & US & msgDate & US & msgContent & US & msgId & US & folderName
+              if totalFound > 0 then
+                set output to output & RS & msgLine
+              else
+                set output to msgLine
+              end if
+              set totalFound to totalFound + 1
+            end repeat
           end if
+
+          if totalFound >= msgLimit then exit repeat
         end repeat
 
         return (totalUnread as text) & US & output
@@ -624,11 +661,12 @@ async function getUnreadEmails(
         dateSent: parts[2] || new Date().toString(),
         content: parts[3] || "[Content not available]",
         id: parts[4] || "",
+        folder: parts[5] || folder,
       });
     }
 
     console.error(
-      `[getUnreadEmails] Found ${emails.length} unread emails (${totalUnread} total unread)`,
+      `[getUnreadEmails] Found ${emails.length} unread emails (${totalUnread} total unread across all subfolders)`,
     );
     return emails;
   } catch (error) {
@@ -1073,68 +1111,42 @@ async function getMailFolders(): Promise<string[]> {
   const script = `
       tell application "Microsoft Outlook"
         set LF to (ASCII character 10)
-
-        script Walker
-          on walk(theFolder, prefix, depth)
-            set n to name of theFolder
-            set fullPath to prefix & n
-            set indent to ""
-            repeat depth times
-              set indent to indent & "  "
-            end repeat
-
-            set line_ to indent & n & "  ::  " & fullPath & LF
-
-            set subOutput to ""
-            try
-              set subs to mail folders of theFolder
-              repeat with sf in subs
-                set subOutput to subOutput & (my walk(sf, fullPath & "/", depth + 1))
-              end repeat
-            end try
-
-            return line_ & subOutput
-          end walk
-        end script
-
         set output to ""
 
         try
           set acct to exchange account 1
-
-          -- Inbox first (special property)
-          try
-            set output to output & Walker's walk(inbox of acct, "", 0)
-          end try
-
-          -- Drafts
-          try
-            set output to output & Walker's walk(drafts folder of acct, "", 0)
-          end try
-
-          -- Sent Items
-          try
-            set output to output & Walker's walk(sent items of acct, "", 0)
-          end try
-
-          -- Deleted Items
-          try
-            set output to output & Walker's walk(deleted items folder of acct, "", 0)
-          end try
-
-          -- Junk Email
-          try
-            set output to output & Walker's walk(junk email folder of acct, "", 0)
-          end try
-
-          -- All other top-level folders (skip the ones we already listed)
-          set specialNames to {"Inbox", "Drafts", "Sent Items", "Deleted Items", "Junk Email", "Junk E-mail"}
           set topFolders to mail folders of acct
-          repeat with f in topFolders
-            set fName to name of f
-            if fName is not in specialNames then
-              set output to output & Walker's walk(f, "", 0)
-            end if
+
+          repeat with f1 in topFolders
+            set n1 to name of f1
+            set output to output & n1 & LF
+
+            -- Level 2: direct subfolders
+            try
+              set subs1 to mail folders of f1
+              repeat with f2 in subs1
+                set n2 to name of f2
+                set output to output & "  " & n2 & "  ::  " & n1 & "/" & n2 & LF
+
+                -- Level 3
+                try
+                  set subs2 to mail folders of f2
+                  repeat with f3 in subs2
+                    set n3 to name of f3
+                    set output to output & "    " & n3 & "  ::  " & n1 & "/" & n2 & "/" & n3 & LF
+
+                    -- Level 4
+                    try
+                      set subs3 to mail folders of f3
+                      repeat with f4 in subs3
+                        set n4 to name of f4
+                        set output to output & "      " & n4 & "  ::  " & n1 & "/" & n2 & "/" & n3 & "/" & n4 & LF
+                      end repeat
+                    end try
+                  end repeat
+                end try
+              end repeat
+            end try
           end repeat
 
         on error errMsg
@@ -2727,10 +2739,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         emails
                           .map(
                             (email) =>
-                              `[${email.dateSent}] From: ${email.sender}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
+                              `[${email.dateSent}] From: ${email.sender}\nFolder: ${email.folder || "Inbox"}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
                           )
                           .join("\n\n")
-                      : `No unread emails found${args.folder ? ` in folder "${args.folder}"` : ""}`,
+                      : `No unread emails found${args.folder ? ` in folder "${args.folder}" or its subfolders` : ""}`,
                 },
               ],
               isError: false,
