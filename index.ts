@@ -32,6 +32,124 @@ function escapeForAppleScript(str: string): string {
 }
 
 /**
+ * Generate AppleScript code to resolve a mail folder by name or slash-delimited path.
+ *
+ * Supports three forms:
+ *   "Inbox"                        → Exchange inbox (special-cased)
+ *   "Inbox/AWS Notifications/Sub"  → walk the folder tree from inbox
+ *   "AWS Notifications"            → flat name search (backward compatible)
+ *
+ * The generated code stores the resolved folder reference in `varName`.
+ */
+function folderResolverScript(
+  folder: string,
+  varName: string = "targetFolder",
+): string {
+  const escaped = escapeForAppleScript(folder);
+  return `
+        -- ── Resolve folder: "${escaped}" ──
+        set ${varName} to missing value
+        set _folderPath to "${escaped}"
+        if _folderPath is "Inbox" then
+          try
+            set ${varName} to inbox of exchange account 1
+          on error
+            set ${varName} to inbox
+          end try
+        else if _folderPath contains "/" then
+          -- Path-based resolution: walk the tree
+          set saveTID to AppleScript's text item delimiters
+          set AppleScript's text item delimiters to "/"
+          set pathParts to text items of _folderPath
+          set AppleScript's text item delimiters to saveTID
+
+          set firstPart to item 1 of pathParts
+          if firstPart is "Inbox" then
+            try
+              set ${varName} to inbox of exchange account 1
+            on error
+              set ${varName} to inbox
+            end try
+          else
+            try
+              repeat with mf in (mail folders of exchange account 1)
+                if name of mf is firstPart then
+                  set ${varName} to mf
+                  exit repeat
+                end if
+              end repeat
+            on error
+              -- Fall back to flat search for first component
+              repeat with mf in (every mail folder)
+                if name of mf is firstPart then
+                  set ${varName} to mf
+                  exit repeat
+                end if
+              end repeat
+            end try
+          end if
+
+          if ${varName} is not missing value and (count of pathParts) > 1 then
+            repeat with i from 2 to count of pathParts
+              set subName to item i of pathParts
+              set foundSub to false
+              repeat with sf in (mail folders of ${varName})
+                if name of sf is subName then
+                  set ${varName} to sf
+                  set foundSub to true
+                  exit repeat
+                end if
+              end repeat
+              if not foundSub then
+                set ${varName} to missing value
+                exit repeat
+              end if
+            end repeat
+          end if
+        else
+          -- Flat name search (backward compatible)
+          repeat with mf in (every mail folder)
+            if name of mf is _folderPath then
+              set ${varName} to mf
+              exit repeat
+            end if
+          end repeat
+        end if
+        if ${varName} is missing value then
+          error "Folder not found: " & _folderPath
+        end if`;
+}
+
+/**
+ * Generate AppleScript code to extract sender name + address from a message.
+ *
+ * Tries `name of sender` and `address of sender` first, combining them as
+ * "Display Name <addr@example.com>".  Falls back to coercing the sender
+ * object to text, then to "unknown".
+ */
+function senderScript(msgVar: string, resultVar: string): string {
+  return `
+            set ${resultVar} to "unknown"
+            try
+              set _sName to name of sender of ${msgVar}
+              set _sAddr to address of sender of ${msgVar}
+              if _sName is not missing value and _sName is not "" and _sAddr is not missing value and _sAddr is not "" then
+                set ${resultVar} to _sName & " <" & _sAddr & ">"
+              else if _sName is not missing value and _sName is not "" then
+                set ${resultVar} to _sName
+              else if _sAddr is not missing value and _sAddr is not "" then
+                set ${resultVar} to _sAddr
+              end if
+            on error
+              try
+                set ${resultVar} to (sender of ${msgVar} as text)
+              on error
+                set ${resultVar} to "unknown"
+              end try
+            end try`;
+}
+
+/**
  * Load attachment allowlist from config.json.
  * Falls back to sensible defaults if the config file is missing or malformed.
  */
@@ -164,7 +282,7 @@ const OUTLOOK_MAIL_TOOL: Tool = {
       folder: {
         type: "string",
         description:
-          "Email folder to use (optional - if not provided, uses inbox or searches across all folders)",
+          "Email folder name or slash-delimited path (e.g. 'Inbox', 'Inbox/AWS Notifications/Pfizer CPDB ETL', '_Projects'). Paths walk the folder tree; plain names do a flat search. Defaults to Inbox.",
       },
       limit: {
         type: "number",
@@ -420,63 +538,49 @@ async function getUnreadEmails(
   );
   await checkOutlookAccess();
 
-  const isDefaultInbox_unread = folder === "Inbox";
-  const folderSetup_unread = isDefaultInbox_unread
-    ? `-- Prefer Exchange account inbox over local inbox
-        try
-          set theFolder to inbox of exchange account 1
-        on error
-          set theFolder to inbox
-        end try`
-    : `-- Search for custom folder by name
-        set theFolder to inbox
-        set allFolders to every mail folder
-        repeat with mailFolder in allFolders
-          if name of mailFolder is "${escapeForAppleScript(folder)}" then
-            set theFolder to mailFolder
-            exit repeat
-          end if
-        end repeat`;
   const script = `
     tell application "Microsoft Outlook"
       try
-        ${folderSetup_unread}
-        set unreadMessages to {}
-        set allMessages to messages of theFolder
-        set i to 0
+        ${folderResolverScript(folder, "theFolder")}
 
-        repeat with theMessage in allMessages
-          if is read of theMessage is false then
-            set i to i + 1
-            try
-              set senderAddr to address of sender of theMessage
-            on error
-              set senderAddr to "unknown"
-            end try
-            set msgData to {subject:subject of theMessage, sender:senderAddr, ¬
-                       date:time sent of theMessage, id:id of theMessage}
+        set RS to ASCII character 30
+        set US to ASCII character 31
 
-            -- Try to get content
-            try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
-              end if
-              set msgData to msgData & {content:msgContent}
-            on error
-              set msgData to msgData & {content:"[Content not available]"}
-            end try
+        -- Use "whose" for fast server-side filtering instead of iterating all messages
+        set unreadMsgs to (every message of theFolder whose is read is false)
+        set msgLimit to ${limit}
+        set totalUnread to count of unreadMsgs
+        if totalUnread < msgLimit then set msgLimit to totalUnread
 
-            set end of unreadMessages to msgData
+        set output to ""
+        repeat with i from 1 to msgLimit
+          set theMsg to item i of unreadMsgs
 
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
+          set msgSubject to subject of theMsg
+          ${senderScript("theMsg", "senderInfo")}
+          set msgDate to time sent of theMsg as text
+          set msgId to id of theMsg as text
+
+          -- Try to get content preview
+          set msgContent to "[Content not available]"
+          try
+            set rawContent to content of theMsg
+            if length of rawContent > 500 then
+              set msgContent to (text 1 thru 500 of rawContent) & "..."
+            else
+              set msgContent to rawContent
             end if
+          end try
+
+          set msgLine to msgSubject & US & senderInfo & US & msgDate & US & msgContent & US & msgId
+          if i > 1 then
+            set output to output & RS & msgLine
+          else
+            set output to msgLine
           end if
         end repeat
 
-        return unreadMessages
+        return (totalUnread as text) & US & output
       on error errMsg
         return "Error: " & errMsg
       end try
@@ -487,50 +591,45 @@ async function getUnreadEmails(
     const result = await runAppleScript(script);
     console.error(`[getUnreadEmails] Raw result length: ${result.length}`);
 
-    // Parse the results (AppleScript returns records as text)
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
 
-    // Simple parsing for demonstration
-    // In a production environment, you'd want more robust parsing
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(",");
-          const email: any = {};
-
-          props.forEach((prop) => {
-            const parts = prop.split(":");
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(":").trim();
-              email[key] = value;
-            }
-          });
-
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || "",
-            });
-          }
-        } catch (parseError) {
-          console.error(
-            "[getUnreadEmails] Error parsing email match:",
-            parseError,
-          );
-        }
-      }
+    // First field before the first US is the total unread count, rest is message data
+    const headerSplit = result.indexOf("\x1F");
+    if (headerSplit === -1) {
+      // Only got the count, no messages (e.g. "0" with empty output)
+      console.error("[getUnreadEmails] Found 0 unread emails");
+      return [];
     }
 
-    console.error(`[getUnreadEmails] Found ${emails.length} unread emails`);
+    const totalUnread = parseInt(result.substring(0, headerSplit), 10) || 0;
+    const messagesStr = result.substring(headerSplit + 1);
+
+    const emails: any[] = [];
+    if (messagesStr.trim() === "") {
+      console.error(
+        `[getUnreadEmails] ${totalUnread} total unread, 0 returned`,
+      );
+      return emails;
+    }
+
+    const messageChunks = messagesStr.split("\x1E"); // RS between messages
+    for (const chunk of messageChunks) {
+      if (!chunk.trim()) continue;
+      const parts = chunk.split("\x1F"); // US between fields
+      emails.push({
+        subject: parts[0] || "No subject",
+        sender: parts[1] || "Unknown sender",
+        dateSent: parts[2] || new Date().toString(),
+        content: parts[3] || "[Content not available]",
+        id: parts[4] || "",
+      });
+    }
+
+    console.error(
+      `[getUnreadEmails] Found ${emails.length} unread emails (${totalUnread} total unread)`,
+    );
     return emails;
   } catch (error) {
     console.error("[getUnreadEmails] Error getting unread emails:", error);
@@ -549,64 +648,54 @@ async function searchEmails(
   );
   await checkOutlookAccess();
 
-  const isDefaultInbox_search = folder === "Inbox";
-  const folderSetup_search = isDefaultInbox_search
-    ? `-- Prefer Exchange account inbox over local inbox
-        try
-          set theFolder to inbox of exchange account 1
-        on error
-          set theFolder to inbox
-        end try`
-    : `-- Search for custom folder by name
-        set theFolder to inbox
-        set allFolders to every mail folder
-        repeat with mailFolder in allFolders
-          if name of mailFolder is "${escapeForAppleScript(folder)}" then
-            set theFolder to mailFolder
-            exit repeat
-          end if
-        end repeat`;
   const script = `
     tell application "Microsoft Outlook"
       try
-        ${folderSetup_search}
-        set searchResults to {}
+        ${folderResolverScript(folder, "theFolder")}
+
+        set RS to ASCII character 30
+        set US to ASCII character 31
+        set searchString to "${escapeForAppleScript(searchTerm)}"
         set allMessages to messages of theFolder
         set i to 0
-        set searchString to "${escapeForAppleScript(searchTerm)}"
+        set output to ""
 
         repeat with theMessage in allMessages
-          if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
-            set i to i + 1
-            try
-              set senderAddr to address of sender of theMessage
-            on error
-              set senderAddr to "unknown"
-            end try
-            set msgData to {subject:subject of theMessage, sender:senderAddr, ¬
-                       date:time sent of theMessage, id:id of theMessage}
+          try
+            if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
+              set i to i + 1
 
-            -- Try to get content
-            try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
+              set msgSubject to subject of theMessage
+              ${senderScript("theMessage", "senderInfo")}
+              set msgDate to time sent of theMessage as text
+              set msgId to id of theMessage as text
+
+              -- Try to get content preview
+              set msgContent to "[Content not available]"
+              try
+                set rawContent to content of theMessage
+                if length of rawContent > 500 then
+                  set msgContent to (text 1 thru 500 of rawContent) & "..."
+                else
+                  set msgContent to rawContent
+                end if
+              end try
+
+              set msgLine to msgSubject & US & senderInfo & US & msgDate & US & msgContent & US & msgId
+              if i > 1 then
+                set output to output & RS & msgLine
+              else
+                set output to msgLine
               end if
-              set msgData to msgData & {content:msgContent}
-            on error
-              set msgData to msgData & {content:"[Content not available]"}
-            end try
 
-            set end of searchResults to msgData
-
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
+              if i >= ${limit} then exit repeat
             end if
-          end if
+          on error
+            -- Skip problematic messages
+          end try
         end repeat
 
-        return searchResults
+        return (i as text) & US & output
       on error errMsg
         return "Error: " & errMsg
       end try
@@ -617,46 +706,37 @@ async function searchEmails(
     const result = await runAppleScript(script);
     console.error(`[searchEmails] Raw result length: ${result.length}`);
 
-    // Parse the results
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
 
-    // Parse the emails similar to unread emails
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
+    // First field before the first US is the match count, rest is message data
+    const headerSplit = result.indexOf("\x1F");
+    if (headerSplit === -1) {
+      console.error("[searchEmails] Found 0 matching emails");
+      return [];
+    }
 
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(",");
-          const email: any = {};
+    const matchCount = parseInt(result.substring(0, headerSplit), 10) || 0;
+    const messagesStr = result.substring(headerSplit + 1);
 
-          props.forEach((prop) => {
-            const parts = prop.split(":");
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(":").trim();
-              email[key] = value;
-            }
-          });
+    const emails: any[] = [];
+    if (messagesStr.trim() === "") {
+      console.error(`[searchEmails] ${matchCount} matches, 0 returned`);
+      return emails;
+    }
 
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || "",
-            });
-          }
-        } catch (parseError) {
-          console.error(
-            "[searchEmails] Error parsing email match:",
-            parseError,
-          );
-        }
-      }
+    const messageChunks = messagesStr.split("\x1E"); // RS between messages
+    for (const chunk of messageChunks) {
+      if (!chunk.trim()) continue;
+      const parts = chunk.split("\x1F"); // US between fields
+      emails.push({
+        subject: parts[0] || "No subject",
+        sender: parts[1] || "Unknown sender",
+        dateSent: parts[2] || new Date().toString(),
+        content: parts[3] || "[Content not available]",
+        id: parts[4] || "",
+      });
     }
 
     console.error(`[searchEmails] Found ${emails.length} matching emails`);
@@ -686,10 +766,10 @@ async function checkAttachmentPath(filePath: string): Promise<string> {
 
       return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
     } catch (err) {
-      return `ERROR: Cannot access file: ${fullPath}\nError details: ${err.message}`;
+      return `ERROR: Cannot access file: ${fullPath}\nError details: ${(err as Error).message}`;
     }
   } catch (error) {
-    return `Failed to check attachment path: ${error.message}`;
+    return `Failed to check attachment path: ${(error as Error).message}`;
   }
 }
 
@@ -751,7 +831,7 @@ async function debugSendEmailWithAttachment(
     return `File check: ${fileStatus}\n\nAttachment test: ${attachResult}`;
   } catch (error) {
     console.error("[debugSendEmail] Error during debug:", error);
-    return `Debugging error: ${error.message}\n\nFile check: ${fileStatus}`;
+    return `Debugging error: ${(error as Error).message}\n\nFile check: ${fileStatus}`;
   }
 }
 // Update the sendEmail function to handle attachments and HTML content
@@ -987,26 +1067,92 @@ async function sendEmail(
 }
 // Function to get mail folders - this works based on your logs
 async function getMailFolders(): Promise<string[]> {
-  console.error("[getMailFolders] Getting mail folders");
+  console.error("[getMailFolders] Getting mail folder tree");
   await checkOutlookAccess();
 
   const script = `
       tell application "Microsoft Outlook"
-        set folderNames to {}
-        set allFolders to mail folders
+        set LF to (ASCII character 10)
 
-        repeat with theFolder in allFolders
-          set end of folderNames to name of theFolder
-        end repeat
+        script Walker
+          on walk(theFolder, prefix, depth)
+            set n to name of theFolder
+            set fullPath to prefix & n
+            set indent to ""
+            repeat depth times
+              set indent to indent & "  "
+            end repeat
 
-        return folderNames
+            set line_ to indent & n & "  ::  " & fullPath & LF
+
+            set subOutput to ""
+            try
+              set subs to mail folders of theFolder
+              repeat with sf in subs
+                set subOutput to subOutput & (my walk(sf, fullPath & "/", depth + 1))
+              end repeat
+            end try
+
+            return line_ & subOutput
+          end walk
+        end script
+
+        set output to ""
+
+        try
+          set acct to exchange account 1
+
+          -- Inbox first (special property)
+          try
+            set output to output & Walker's walk(inbox of acct, "", 0)
+          end try
+
+          -- Drafts
+          try
+            set output to output & Walker's walk(drafts folder of acct, "", 0)
+          end try
+
+          -- Sent Items
+          try
+            set output to output & Walker's walk(sent items of acct, "", 0)
+          end try
+
+          -- Deleted Items
+          try
+            set output to output & Walker's walk(deleted items folder of acct, "", 0)
+          end try
+
+          -- Junk Email
+          try
+            set output to output & Walker's walk(junk email folder of acct, "", 0)
+          end try
+
+          -- All other top-level folders (skip the ones we already listed)
+          set specialNames to {"Inbox", "Drafts", "Sent Items", "Deleted Items", "Junk Email", "Junk E-mail"}
+          set topFolders to mail folders of acct
+          repeat with f in topFolders
+            set fName to name of f
+            if fName is not in specialNames then
+              set output to output & Walker's walk(f, "", 0)
+            end if
+          end repeat
+
+        on error errMsg
+          -- Fallback: flat list from every mail folder
+          set allFolders to every mail folder
+          repeat with mf in allFolders
+            set output to output & name of mf & LF
+          end repeat
+        end try
+
+        return output
       end tell
     `;
 
   try {
     const result = await runAppleScript(script);
-    console.error(`[getMailFolders] Result: ${result}`);
-    return result.split(", ");
+    console.error(`[getMailFolders] Result length: ${result.length}`);
+    return result.split("\n").filter((line) => line.trim() !== "");
   } catch (error) {
     console.error("[getMailFolders] Error getting mail folders:", error);
     throw error;
@@ -1023,59 +1169,49 @@ async function readEmails(
   );
   await checkOutlookAccess();
 
-  // Use a simplified approach that should be more compatible
   const script = `
       tell application "Microsoft Outlook"
         try
-          -- Get the folder, preferring Exchange account
-          set targetFolder to null
-          if "${escapeForAppleScript(folder)}" is "Inbox" then
-            -- Prefer Exchange inbox over local inbox
-            try
-              set targetFolder to inbox of exchange account 1
-            on error
-              set targetFolder to inbox
-            end try
-          else
-            -- Search all mail folders by name
-            set allFolders to every mail folder
-            repeat with mailFolder in allFolders
-              if name of mailFolder is "${escapeForAppleScript(folder)}" then
-                set targetFolder to mailFolder
-                exit repeat
-              end if
-            end repeat
-            if targetFolder is null then set targetFolder to inbox
-          end if
+          ${folderResolverScript(folder, "targetFolder")}
 
-          -- Get messages
-          set messageList to {}
-          set msgCount to 0
+          set RS to ASCII character 30
+          set US to ASCII character 31
+
           set allMsgs to messages of targetFolder
+          set msgCount to 0
+          set output to ""
 
           repeat with i from 1 to (count of allMsgs)
             if msgCount >= ${limit} then exit repeat
 
             try
               set theMsg to item i of allMsgs
-              set msgSubject to subject of theMsg
-              try
-                set msgSender to address of sender of theMsg
-              on error
-                set msgSender to "unknown"
-              end try
-              set msgDate to time sent of theMsg
 
-              -- Create a simple text representation for the message
-              set msgInfo to msgSubject & " | " & msgSender & " | " & msgDate
-              set end of messageList to msgInfo
-              set msgCount to msgCount + 1
+              -- Filter: only process actual mail messages (skip calendar items, etc.)
+              set msgClass to class of theMsg
+              if msgClass is not incoming message and msgClass is not outgoing message then
+                -- skip non-email objects like calendar notifications
+              else
+                set msgSubject to subject of theMsg
+                ${senderScript("theMsg", "senderInfo")}
+                set msgDate to time sent of theMsg as text
+                set msgId to id of theMsg as text
+                set isRead to is read of theMsg as text
+
+                set msgLine to msgSubject & US & senderInfo & US & msgDate & US & msgId & US & isRead
+                if msgCount > 0 then
+                  set output to output & RS & msgLine
+                else
+                  set output to msgLine
+                end if
+                set msgCount to msgCount + 1
+              end if
             on error
               -- Skip problematic messages
             end try
           end repeat
 
-          return messageList
+          return output
         on error errMsg
           return "Error: " & errMsg
         end try
@@ -1089,20 +1225,28 @@ async function readEmails(
       throw new Error(result);
     }
 
-    // Parse the results in a simple format
-    const emails = result.split(", ").map((msgInfo) => {
-      const parts = msgInfo.split(" | ");
-      return {
-        subject: parts[0] || "No subject",
-        sender: parts[1] || "Unknown sender",
-        dateSent: parts[2] || new Date().toString(),
-        content: "Content not retrieved in simple mode",
-      };
-    });
+    if (result.trim() === "") {
+      console.error("[readEmails] No emails found");
+      return [];
+    }
 
-    console.error(
-      `[readEmails] Found ${emails.length} emails using simplified approach`,
-    );
+    // Parse using record separator (RS) between messages, unit separator (US) between fields
+    const messageChunks = result.split("\x1E"); // RS
+    const emails = messageChunks
+      .filter((chunk) => chunk.trim() !== "")
+      .map((chunk) => {
+        const parts = chunk.split("\x1F"); // US
+        return {
+          subject: parts[0] || "No subject",
+          sender: parts[1] || "Unknown sender",
+          dateSent: parts[2] || new Date().toString(),
+          id: parts[3] || "",
+          isRead: parts[4] === "true",
+          content: "Use get_message with messageIndex to retrieve full content",
+        };
+      });
+
+    console.error(`[readEmails] Found ${emails.length} emails`);
     return emails;
   } catch (error) {
     console.error("[readEmails] Error reading emails:", error);
@@ -1125,7 +1269,6 @@ async function deleteEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
   const escapedFilter = subjectFilter
     ? escapeForAppleScript(subjectFilter)
     : "";
@@ -1133,23 +1276,7 @@ async function deleteEmails(
   const script = `
     tell application "Microsoft Outlook"
       try
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
         set deletedCount to 0
         set useFilter to ${subjectFilter ? "true" : "false"}
@@ -1227,8 +1354,6 @@ async function moveEmails(
   );
   await checkOutlookAccess();
 
-  const escapedSource = escapeForAppleScript(sourceFolder);
-  const escapedDest = escapeForAppleScript(destinationFolder);
   const escapedFilter = subjectFilter
     ? escapeForAppleScript(subjectFilter)
     : "";
@@ -1236,45 +1361,9 @@ async function moveEmails(
   const script = `
     tell application "Microsoft Outlook"
       try
-        -- Find source folder
-        set targetFolder to null
-        if "${escapedSource}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedSource}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(sourceFolder, "targetFolder")}
 
-        -- Find destination folder
-        set destFolder to null
-        if "${escapedDest}" is "Inbox" then
-          try
-            set destFolder to inbox of exchange account 1
-          on error
-            set destFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedDest}" then
-              set destFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if destFolder is null then
-            return "Error: Destination folder \\"${escapedDest}\\" not found"
-          end if
-        end if
+        ${folderResolverScript(destinationFolder, "destFolder")}
 
         set movedCount to 0
         set useFilter to ${subjectFilter ? "true" : "false"}
@@ -1351,7 +1440,6 @@ async function markEmailsRead(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
   const escapedFilter = subjectFilter
     ? escapeForAppleScript(subjectFilter)
     : "";
@@ -1359,23 +1447,7 @@ async function markEmailsRead(
   const script = `
     tell application "Microsoft Outlook"
       try
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
         set markedCount to 0
         set useFilter to ${subjectFilter ? "true" : "false"}
@@ -1439,7 +1511,6 @@ async function countEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
   const escapedFilter = subjectFilter
     ? escapeForAppleScript(subjectFilter)
     : "";
@@ -1447,23 +1518,7 @@ async function countEmails(
   const script = `
     tell application "Microsoft Outlook"
       try
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
         set allMsgs to messages of targetFolder
         set totalCount to count of allMsgs
@@ -1525,28 +1580,10 @@ async function getMessageDetail(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
-
   const script = `
     tell application "Microsoft Outlook"
       try
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
         set allMsgs to messages of targetFolder
         set msgTotal to count of allMsgs
@@ -1559,11 +1596,7 @@ async function getMessageDetail(
 
         set msgSubject to subject of theMsg
 
-        try
-          set msgSender to address of sender of theMsg
-        on error
-          set msgSender to "unknown"
-        end try
+        ${senderScript("theMsg", "msgSender")}
 
         set msgDate to time sent of theMsg
 
@@ -1589,7 +1622,7 @@ async function getMessageDetail(
         try
           set msgFolderName to name of targetFolder
         on error
-          set msgFolderName to "${escapedFolder}"
+          set msgFolderName to "${escapeForAppleScript(folder)}"
         end try
 
         set attachCount to 0
@@ -1668,7 +1701,6 @@ async function forwardEmail(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
   const escapedTo = escapeForAppleScript(to);
   const escapedComment = comment
     ? escapeForAppleScript(comment).replace(/\n/g, "\\n")
@@ -1677,23 +1709,7 @@ async function forwardEmail(
   const script = `
     tell application "Microsoft Outlook"
       try
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
         set allMsgs to messages of targetFolder
         set msgTotal to count of allMsgs
@@ -1758,7 +1774,6 @@ async function archiveEmails(
   );
   await checkOutlookAccess();
 
-  const escapedFolder = escapeForAppleScript(folder);
   const escapedFilter = subjectFilter
     ? escapeForAppleScript(subjectFilter)
     : "";
@@ -1766,38 +1781,9 @@ async function archiveEmails(
   const script = `
     tell application "Microsoft Outlook"
       try
-        -- Find source folder
-        set targetFolder to null
-        if "${escapedFolder}" is "Inbox" then
-          try
-            set targetFolder to inbox of exchange account 1
-          on error
-            set targetFolder to inbox
-          end try
-        else
-          set allFolders to every mail folder
-          repeat with mailFolder in allFolders
-            if name of mailFolder is "${escapedFolder}" then
-              set targetFolder to mailFolder
-              exit repeat
-            end if
-          end repeat
-          if targetFolder is null then set targetFolder to inbox
-        end if
+        ${folderResolverScript(folder, "targetFolder")}
 
-        -- Find Archive folder
-        set archiveFolder to null
-        set allFolders to every mail folder
-        repeat with mailFolder in allFolders
-          if name of mailFolder is "Archive" then
-            set archiveFolder to mailFolder
-            exit repeat
-          end if
-        end repeat
-
-        if archiveFolder is null then
-          return "Error: Archive folder not found"
-        end if
+        ${folderResolverScript("Archive", "archiveFolder")}
 
         set archivedCount to 0
         set useFilter to ${subjectFilter ? "true" : "false"}
@@ -2815,14 +2801,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           case "folders": {
-            const folders = await getMailFolders();
+            const rawLines = await getMailFolders();
+            // Each line is "  Name  ::  Full/Path" — format into a readable tree
+            // with the path shown after the name for reference
+            const treeLines = rawLines.map((line) => {
+              const sepIdx = line.indexOf("  ::  ");
+              if (sepIdx === -1) return line; // fallback line without path
+              const display = line.substring(0, sepIdx);
+              const fullPath = line.substring(sepIdx + 6);
+              // Only show path if it differs from name (i.e. has depth)
+              if (fullPath.includes("/")) {
+                return `${display}  →  ${fullPath}`;
+              }
+              return display;
+            });
             return {
               content: [
                 {
                   type: "text",
                   text:
-                    folders.length > 0
-                      ? `Found ${folders.length} mail folders:\n\n${folders.join("\n")}`
+                    treeLines.length > 0
+                      ? `Mail folder tree (${treeLines.length} folders):\n\nUse the full path (shown after →) as the 'folder' parameter for nested folders.\n\n${treeLines.join("\n")}`
                       : "No mail folders found. Make sure Outlook is running and properly configured.",
                 },
               ],
